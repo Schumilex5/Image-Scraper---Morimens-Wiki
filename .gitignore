@@ -1,0 +1,18 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Selenium / Chrome profile data
+chrome_selenium_profile/
+
+# Scraped data/images
+scraped_images/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables / Secrets
+.env
