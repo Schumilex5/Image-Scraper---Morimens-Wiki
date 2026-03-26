@@ -347,7 +347,9 @@ class ImageScraper:
     def collect_images(self, folder):
         """Download every huiji-hosted image on the current page."""
         self.scroll_page()
-        imgs = self.driver.find_elements(By.TAG_NAME, "img")
+        imgs = self.driver.find_elements(
+            By.CSS_SELECTOR, ".mw-parser-output img"
+        )
         page_seen: set[str] = set()
         count = 0
         for img in imgs:
@@ -417,6 +419,72 @@ class ImageScraper:
     # ═══════════════════════════════════════════════════════════
     #  SCRAPING METHODS — one per wiki page
     # ═══════════════════════════════════════════════════════════
+
+    def _save_activity_text(self, folder, activity_name):
+        """Extract text after 活动说明 heading, translate, save as .txt."""
+        try:
+            # Use JavaScript to extract text content between 活动说明 heading
+            # and the NewPP limit report comment
+            js = """
+            // Find the 活动说明 heading
+            var headings = document.querySelectorAll('.mw-headline');
+            var target = null;
+            for (var i = 0; i < headings.length; i++) {
+                if (headings[i].id === '活动说明' || headings[i].textContent.trim() === '活动说明') {
+                    target = headings[i].closest('h2') || headings[i].closest('h3');
+                    break;
+                }
+            }
+            if (!target) return null;
+
+            var parts = [];
+            var node = target.nextSibling;
+            while (node) {
+                // Stop at HTML comment containing 'NewPP limit report'
+                if (node.nodeType === 8 && node.textContent.indexOf('NewPP limit report') !== -1) break;
+                // Stop at next h2
+                if (node.nodeType === 1 && node.tagName === 'H2') break;
+
+                if (node.nodeType === 1) {
+                    // Handle tables specially
+                    var tables = node.querySelectorAll ? node.querySelectorAll('table') : [];
+                    if (node.tagName === 'TABLE' || tables.length > 0) {
+                        var tbl = node.tagName === 'TABLE' ? node : tables[0];
+                        var rows = tbl.querySelectorAll('tr');
+                        for (var r = 0; r < rows.length; r++) {
+                            var cells = rows[r].querySelectorAll('th, td');
+                            var cellTexts = [];
+                            for (var c = 0; c < cells.length; c++) {
+                                cellTexts.push(cells[c].textContent.trim());
+                            }
+                            parts.push(cellTexts.join(' | '));
+                        }
+                    } else {
+                        var txt = node.textContent.trim();
+                        if (txt) parts.push(txt);
+                    }
+                } else if (node.nodeType === 3) {
+                    var t = node.textContent.trim();
+                    if (t) parts.push(t);
+                }
+                node = node.nextSibling;
+            }
+            return parts.join('\\n');
+            """
+            raw_text = self.driver.execute_script(js)
+            if not raw_text or not raw_text.strip():
+                self.log(f"  No activity description found.")
+                return
+
+            # Translate the text
+            translated = self.trans.translate(raw_text.strip())
+            fname = self._translate_folder(activity_name) if activity_name else "activity"
+            txt_path = os.path.join(folder, sanitize_filename(fname) + ".txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(translated)
+            self.log(f"  Saved description: {os.path.basename(txt_path)}")
+        except Exception as exc:
+            self.log(f"  Text extraction error: {exc}")
 
     def _simple(self, url, folder_name, title):
         folder = os.path.join(self.base_dir, folder_name)
@@ -522,21 +590,32 @@ class ImageScraper:
             self.log(f"[{i+1}/{len(all_links)}] {name}")
             self.navigate(href)
 
-            # Grab only the single weapon image inside div.floatnone
-            try:
-                img = self.driver.find_element(
-                    By.CSS_SELECTOR, "div.floatnone img[src*='huijistatic.com']"
-                )
-                src = img.get_attribute("src") or ""
-                alt = img.get_attribute("alt") or name or ""
-                orig = get_original_image_url(src) if src else None
-                if orig:
-                    cname = re.sub(r"\.(png|jpg|jpeg|webp|gif)$", "", alt, flags=re.I).strip()
-                    self.download_image(orig, folder, cname or name, fallback_url=src)
-                else:
-                    self.log(f"  No valid image src found")
-            except NoSuchElementException:
-                self.log(f"  No div.floatnone image found on this page")
+            # Grab only the weapon image (not the 2560x1440 character art)
+            found = False
+            imgs = self.driver.find_elements(
+                By.CSS_SELECTOR, "div.floatnone img[src*='huijistatic.com']"
+            )
+            for img in imgs:
+                try:
+                    fw = img.get_attribute("data-file-width") or ""
+                    fh = img.get_attribute("data-file-height") or ""
+                    # Skip character art (2560x1440 or similarly large wide images)
+                    if fw.isdigit() and fh.isdigit():
+                        w, h = int(fw), int(fh)
+                        if w >= 2000 and h >= 1000:
+                            continue
+                    src = img.get_attribute("src") or ""
+                    alt = img.get_attribute("alt") or name or ""
+                    orig = get_original_image_url(src) if src else None
+                    if orig:
+                        cname = re.sub(r"\.(png|jpg|jpeg|webp|gif)$", "", alt, flags=re.I).strip()
+                        self.download_image(orig, folder, cname or name, fallback_url=src)
+                        found = True
+                        break
+                except StaleElementReferenceException:
+                    continue
+            if not found:
+                self.log(f"  No weapon image found on this page")
 
     # ── 5. Secret Contract (密契) ──────────────────────────────
     def scrape_secret_contract(self):
@@ -589,17 +668,166 @@ class ImageScraper:
 
     # ── 7. Materials (材料) ────────────────────────────────────
     def scrape_materials(self):
-        self._visit_links_one_folder(
-            "https://morimens.huijiwiki.com/wiki/%E6%9D%90%E6%96%99",
-            "Materials", "7. Materials (材料)",
+        url = "https://morimens.huijiwiki.com/wiki/%E6%9D%90%E6%96%99"
+        folder = os.path.join(self.base_dir, "Materials")
+        self.log("=== 7. Materials (材料) ===")
+        self._ensure(folder)
+        self.navigate(url)
+        self.scroll_page()
+
+        # Material links are inside specific div containers
+        link_els = self.driver.find_elements(
+            By.CSS_SELECTOR,
+            ".mw-parser-output div[style*='display:flex'] a[href*='/wiki/']"
         )
+        links = []
+        seen = set()
+        for el in link_els:
+            try:
+                href = el.get_attribute("href") or ""
+                title = el.get_attribute("title") or el.text or ""
+            except StaleElementReferenceException:
+                continue
+            base = href.split("#")[0]
+            if base and base not in seen and is_content_link(href, url):
+                seen.add(base)
+                links.append((href, title.strip()))
+
+        self.log(f"Found {len(links)} material links.")
+        for i, (href, name) in enumerate(links):
+            if self.stopped:
+                break
+            self.log(f"[{i+1}/{len(links)}] {name}")
+            self.navigate(href)
+
+            # Grab the single material image (180px display div)
+            found = False
+            imgs = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                ".mw-parser-output div[style*='display:flex'] img[src*='huijistatic.com']"
+            )
+            for img in imgs:
+                try:
+                    src = img.get_attribute("src") or ""
+                    alt = img.get_attribute("alt") or name or ""
+                    orig = get_original_image_url(src) if src else None
+                    if orig:
+                        cname = re.sub(r"\.(png|jpg|jpeg|webp|gif)$", "", alt, flags=re.I).strip()
+                        self.download_image(orig, folder, cname or name, fallback_url=src)
+                        found = True
+                        break
+                except StaleElementReferenceException:
+                    continue
+            if not found:
+                # Fallback: grab any image in mw-parser-output
+                try:
+                    img = self.driver.find_element(
+                        By.CSS_SELECTOR,
+                        ".mw-parser-output img[src*='huijistatic.com']"
+                    )
+                    src = img.get_attribute("src") or ""
+                    alt = img.get_attribute("alt") or name or ""
+                    orig = get_original_image_url(src) if src else None
+                    if orig:
+                        cname = re.sub(r"\.(png|jpg|jpeg|webp|gif)$", "", alt, flags=re.I).strip()
+                        self.download_image(orig, folder, cname or name, fallback_url=src)
+                except NoSuchElementException:
+                    self.log(f"  No image found for this material")
 
     # ── 8. Creations (造物) ────────────────────────────────────
     def scrape_creations(self):
-        self._visit_links_one_folder(
-            "https://morimens.huijiwiki.com/wiki/%E9%80%A0%E7%89%A9",
-            "Creations", "8. Creations (造物)",
+        url = "https://morimens.huijiwiki.com/wiki/%E9%80%A0%E7%89%A9"
+        folder = os.path.join(self.base_dir, "Creations")
+        self.log("=== 8. Creations (造物) ===")
+        self._ensure(folder)
+        self.navigate(url)
+        self.scroll_page()
+
+        # Pagination
+        page_btns = self.driver.find_elements(
+            By.CSS_SELECTOR,
+            ".pagination-0 .topage, #pagination .topage, "
+            ".mw-parser-output .topage, .tabber .topage",
         )
+        n_pages = max(len(page_btns), 1)
+        self.log(f"Found {n_pages} pagination page(s).")
+
+        all_links: list[tuple[str, str]] = []
+        seen_bases: set[str] = set()
+
+        for p in range(n_pages):
+            if self.stopped:
+                break
+            if p > 0:
+                try:
+                    btns = self.driver.find_elements(
+                        By.CSS_SELECTOR,
+                        ".pagination-0 .topage, #pagination .topage, "
+                        ".mw-parser-output .topage, .tabber .topage",
+                    )
+                    if p < len(btns):
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView(true);", btns[p]
+                        )
+                        time.sleep(0.3)
+                        btns[p].click()
+                        time.sleep(2)
+                        self.scroll_page()
+                except Exception as exc:
+                    self.log(f"  Pagination error p{p+1}: {exc}")
+                    continue
+
+            # Creation links are in td cells
+            page_links = self._content_links(selector="td a[href*='/wiki/']", cur_url=url)
+            for href, title in page_links:
+                base = href.split("#")[0]
+                if base not in seen_bases and title:
+                    seen_bases.add(base)
+                    all_links.append((href, title))
+            self.log(f"  Page {p+1}: +{len(page_links)} links  (total unique: {len(all_links)})")
+
+        self.log(f"Visiting {len(all_links)} creation pages for single image each...")
+        for i, (href, name) in enumerate(all_links):
+            if self.stopped:
+                break
+            self.log(f"[{i+1}/{len(all_links)}] {name}")
+            self.navigate(href)
+
+            # Detect blank/error pages and retry once
+            content = self.driver.find_elements(By.CSS_SELECTOR, ".mw-parser-output")
+            if not content:
+                self.log(f"  Blank page detected, retrying...")
+                self.navigate(href)
+                content = self.driver.find_elements(By.CSS_SELECTOR, ".mw-parser-output")
+                if not content:
+                    self.log(f"  Still blank, skipping.")
+                    continue
+
+            # Grab the single creation image (in a td with text-align:center)
+            found = False
+            imgs = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                ".mw-parser-output td img[src*='huijistatic.com']"
+            )
+            if not imgs:
+                imgs = self.driver.find_elements(
+                    By.CSS_SELECTOR,
+                    ".mw-parser-output img[src*='huijistatic.com']"
+                )
+            for img in imgs:
+                try:
+                    src = img.get_attribute("src") or ""
+                    alt = img.get_attribute("alt") or name or ""
+                    orig = get_original_image_url(src) if src else None
+                    if orig:
+                        cname = re.sub(r"\.(png|jpg|jpeg|webp|gif)$", "", alt, flags=re.I).strip()
+                        self.download_image(orig, folder, cname or name, fallback_url=src)
+                        found = True
+                        break
+                except StaleElementReferenceException:
+                    continue
+            if not found:
+                self.log(f"  No image found for this creation")
 
     # ── 9. Engravings (刻印) ───────────────────────────────────
     def scrape_engravings(self):
@@ -647,6 +875,7 @@ class ImageScraper:
         url = "https://morimens.huijiwiki.com/wiki/%E6%B4%BB%E5%8A%A8"
         folder = os.path.join(self.base_dir, "Activities")
         self.log("=== 13. Activities (活动) ===")
+        self._ensure(folder)
         self.navigate(url)
         self.scroll_page()
 
@@ -661,13 +890,129 @@ class ImageScraper:
             self.log(f"[{i+1}/{len(links)}] {name}")
             self.navigate(href)
             self.collect_images(folder)
+            # Extract activity description text
+            self._save_activity_text(folder, name)
 
     # ── 14. Awakening (唤醒) ───────────────────────────────────
     def scrape_awakening(self):
-        self._simple(
-            "https://morimens.huijiwiki.com/wiki/%E5%94%A4%E9%86%92",
-            "Awakening", "14. Awakening (唤醒)",
-        )
+        url = "https://morimens.huijiwiki.com/wiki/%E5%94%A4%E9%86%92"
+        folder = os.path.join(self.base_dir, "Awakening")
+        self.log("=== 14. Awakening (唤醒) ===")
+        self._ensure(folder)
+        self.navigate(url)
+        self.scroll_page()
+
+        # Each awakening entry is a flex row with border-bottom
+        rows = self.driver.execute_script("""
+            var rows = document.querySelectorAll('.mw-parser-output div[style*="border-bottom"]');
+            var result = [];
+            for (var i = 0; i < rows.length; i++) {
+                var row = rows[i];
+                var style = row.getAttribute('style') || '';
+                if (style.indexOf('display:flex') === -1 && style.indexOf('display: flex') === -1) continue;
+
+                // Get date/label text from first child div
+                var children = row.children;
+                var dateText = '';
+                if (children.length > 0) {
+                    dateText = children[0].textContent.trim();
+                }
+
+                // Get character names only from avatar images (头像)
+                var avatarImgs = row.querySelectorAll('img[alt*="头像"]');
+                var charNames = [];
+                var seen = {};
+                for (var j = 0; j < avatarImgs.length; j++) {
+                    var parentA = avatarImgs[j].closest('a[href^="/wiki/"]');
+                    if (parentA) {
+                        var t = parentA.getAttribute('title');
+                        if (t && !seen[t]) {
+                            seen[t] = true;
+                            charNames.push(t);
+                        }
+                    }
+                }
+
+                // Get all images
+                var imgs = row.querySelectorAll('img[src*="huijistatic.com"]');
+                var imgData = [];
+                for (var k = 0; k < imgs.length; k++) {
+                    imgData.push({
+                        src: imgs[k].getAttribute('src'),
+                        alt: imgs[k].getAttribute('alt') || '',
+                        fw: imgs[k].getAttribute('data-file-width') || '',
+                        fh: imgs[k].getAttribute('data-file-height') || ''
+                    });
+                }
+
+                // Get banner links (red links to upload pages = missing images)
+                var redLinks = row.querySelectorAll('a.new[title^="文件:"]');
+                var missingBanners = [];
+                for (var m = 0; m < redLinks.length; m++) {
+                    missingBanners.push(redLinks[m].getAttribute('title').replace('文件:', ''));
+                }
+
+                if (charNames.length > 0 || imgData.length > 0) {
+                    result.push({
+                        dateText: dateText,
+                        charNames: charNames,
+                        imgs: imgData,
+                        missingBanners: missingBanners
+                    });
+                }
+            }
+            return result;
+        """)
+
+        if not rows:
+            self.log("No awakening rows found, falling back to simple scrape.")
+            self.collect_images(folder)
+            return
+
+        self.log(f"Found {len(rows)} awakening entries.")
+        for i, row in enumerate(rows):
+            if self.stopped:
+                break
+            char_names = row.get("charNames", [])
+            date_text = row.get("dateText", "")
+            img_data = row.get("imgs", [])
+
+            # Build subfolder name from character names (truncate for Windows)
+            if char_names:
+                raw_name = " + ".join(char_names)
+                sub_name = self._translate_folder(raw_name)
+            else:
+                sub_name = f"awakening_{i+1}"
+            # Windows max path component ~100 chars to stay safe
+            if len(sub_name) > 100:
+                sub_name = sub_name[:100].rstrip(". ")
+            sub_folder = os.path.join(folder, sub_name)
+            self._ensure(sub_folder)
+            self.log(f"[{i+1}/{len(rows)}] {' + '.join(char_names) if char_names else sub_name}")
+
+            # Download images
+            for img in img_data:
+                src = img.get("src", "")
+                alt = img.get("alt", "")
+                if not src:
+                    continue
+                orig = get_original_image_url(src)
+                if orig:
+                    cname = re.sub(r"\.(png|jpg|jpeg|webp|gif)$", "", alt, flags=re.I).strip()
+                    self.download_image(orig, sub_folder, cname or None, fallback_url=src)
+
+            # Save text info
+            text_parts = []
+            if date_text:
+                translated_date = self.trans.translate(date_text)
+                text_parts.append(translated_date)
+            if row.get("missingBanners"):
+                text_parts.append("Missing banners: " + ", ".join(row["missingBanners"]))
+            if text_parts:
+                txt_path = os.path.join(sub_folder, "info.txt")
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(text_parts))
+                self.log(f"  Saved info.txt")
 
     # ── 15. Awakening Simulation (唤醒模拟) ────────────────────
     def scrape_awakening_sim(self):
