@@ -40,6 +40,7 @@ BASE_URL = "https://morimens.huijiwiki.com"
 EXCLUDED_WIKI_PREFIXES = [
     "Special:", "Help:", "Talk:", "Template:", "Category:",
     "File:", "User:", "MediaWiki:", "Module:",
+    "\u6587\u4ef6:",  # 文件: (Chinese for File:)
 ]
 
 TASKS = [
@@ -108,8 +109,9 @@ def is_content_link(href: str, current_url: str | None = None) -> bool:
         return False
     if current_url and href.split("#")[0] == current_url.split("#")[0]:
         return False
+    decoded = unquote(href)
     for prefix in EXCLUDED_WIKI_PREFIXES:
-        if f"/wiki/{prefix}" in href:
+        if f"/wiki/{prefix}" in decoded:
             return False
     return "/wiki/" in href
 
@@ -492,6 +494,82 @@ class ImageScraper:
         self.navigate(url)
         self.collect_images(folder)
 
+    def _collect_character_images(self, folder):
+        """Download only character art, face expressions, and animations.
+
+        Strict whitelist — each image must match one of these exact patterns:
+        1. GIF animation inside .tabber
+        2. Face expression (alt starts with 'Awaker' + contains 'Face')
+        3. Splash art: in div.floatnone, NOT in table/tabber, data-file-width >= 1000
+        4. 启(qi) awakening icons (alt matches 启 + digits)
+        5. Large standalone art NOT in floatnone/table/tabber, both dims >= 400
+        """
+        self.scroll_page()
+        js = """
+        var results = [];
+        var imgs = document.querySelectorAll('.mw-parser-output img');
+        for (var i = 0; i < imgs.length; i++) {
+            var img = imgs[i];
+            var src = img.getAttribute('src') || '';
+            if (src.indexOf('huijistatic.com') === -1 || src.indexOf('/uploads/') === -1) continue;
+            var alt = img.getAttribute('alt') || '';
+            var fw = parseInt(img.getAttribute('data-file-width') || '0');
+            var fh = parseInt(img.getAttribute('data-file-height') || '0');
+
+            // 1. GIF animations inside .tabber
+            if (src.indexOf('.gif') !== -1 && img.closest('.tabber')) {
+                results.push({src: src, alt: alt});
+                continue;
+            }
+            // 2. Face expressions
+            if (/^Awaker/i.test(alt) && /Face/i.test(alt)) {
+                results.push({src: src, alt: alt});
+                continue;
+            }
+            // 3. Skip everything else inside .tabber
+            if (img.closest('.tabber')) continue;
+            // 4. Skip everything inside tables (stat/material/level icons)
+            if (img.closest('table')) continue;
+            // 5. Splash art: in div.floatnone, large image (hero section)
+            if (img.closest('div.floatnone') && fw >= 1000) {
+                results.push({src: src, alt: alt});
+                continue;
+            }
+            // 6. Skip all other div.floatnone images (Lv, progression, small icons)
+            if (img.closest('div.floatnone')) continue;
+            // --- Remaining: standalone images not in floatnone/table/tabber ---
+            // 7. Awakening stage icons (启 + digits)
+            if (/^\\u542f\\d+/.test(alt)) {
+                results.push({src: src, alt: alt});
+                continue;
+            }
+            // 8. Large character art (portrait, story, initial) — both dims >= 400
+            if (fw >= 400 && fh >= 400) {
+                results.push({src: src, alt: alt});
+            }
+        }
+        return results;
+        """
+        wanted = self.driver.execute_script(js) or []
+        page_seen: set[str] = set()
+        count = 0
+        for item in wanted:
+            if self.stopped:
+                break
+            src = item.get("src", "")
+            if not src:
+                continue
+            orig = get_original_image_url(src)
+            if not orig or orig in page_seen:
+                continue
+            page_seen.add(orig)
+            alt = item.get("alt", "").strip()
+            cname = alt if alt else None
+            self.download_image(orig, folder, cname, fallback_url=src)
+            count += 1
+        self.log(f"  Page total: {count} images.")
+        return count
+
     # ── 1. Characters (唤醒体) ─────────────────────────────────
     def scrape_characters(self):
         url = "https://morimens.huijiwiki.com/wiki/%E5%94%A4%E9%86%92%E4%BD%93"
@@ -512,7 +590,7 @@ class ImageScraper:
             char_folder = os.path.join(folder, fname)
             self.log(f"[{i+1}/{len(char_links)}] {name} → {fname}")
             self.navigate(href)
-            self.collect_images(char_folder)
+            self._collect_character_images(char_folder)
 
     # ── 2. Monsters (怪物) ─────────────────────────────────────
     def scrape_monsters(self):
