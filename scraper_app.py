@@ -320,15 +320,11 @@ class ImageScraper:
         self._ensure(folder)
         filepath = os.path.join(folder, filename)
 
-        # Handle name collisions from different images
+        # Skip if already downloaded in a previous run
         if os.path.exists(filepath):
-            if url in self._downloaded_urls:
-                return True
-            base, fext = os.path.splitext(filepath)
-            counter = 2
-            while os.path.exists(f"{base}_{counter}{fext}"):
-                counter += 1
-            filepath = f"{base}_{counter}{fext}"
+            self._downloaded_urls.add(url)
+            self.log(f"  ⊘ {filename} (already exists)")
+            return True
 
         try:
             data = self._js_fetch(url)
@@ -515,35 +511,29 @@ class ImageScraper:
             var alt = img.getAttribute('alt') || '';
             var fw = parseInt(img.getAttribute('data-file-width') || '0');
             var fh = parseInt(img.getAttribute('data-file-height') || '0');
+            var inFloatnone = !!img.closest('div.floatnone');
 
-            // 1. GIF animations inside .tabber
-            if (src.indexOf('.gif') !== -1 && img.closest('.tabber')) {
-                results.push({src: src, alt: alt});
-                continue;
-            }
-            // 2. Face expressions
+            // 1. Face expressions (Awaker...Face)
             if (/^Awaker/i.test(alt) && /Face/i.test(alt)) {
                 results.push({src: src, alt: alt});
                 continue;
             }
-            // 3. Skip everything else inside .tabber
-            if (img.closest('.tabber')) continue;
-            // 4. Skip everything inside tables (stat/material/level icons)
-            if (img.closest('table')) continue;
-            // 5. Splash art: in div.floatnone, large image (hero section)
-            if (img.closest('div.floatnone') && fw >= 1000) {
-                results.push({src: src, alt: alt});
+            // 2. Inside div.floatnone: GIFs or large images (splash art, CG, boss GIFs)
+            if (inFloatnone) {
+                if (src.indexOf('.gif') !== -1 || fw >= 1000) {
+                    results.push({src: src, alt: alt});
+                }
                 continue;
             }
-            // 6. Skip all other div.floatnone images (Lv, progression, small icons)
-            if (img.closest('div.floatnone')) continue;
-            // --- Remaining: standalone images not in floatnone/table/tabber ---
-            // 7. Awakening stage icons (启 + digits)
+            // 3. Skip everything inside tables that isn't in floatnone
+            if (img.closest('table')) continue;
+            // --- Remaining: standalone images not in floatnone/table ---
+            // 4. Awakening stage icons (启 + digits)
             if (/^\\u542f\\d+/.test(alt)) {
                 results.push({src: src, alt: alt});
                 continue;
             }
-            // 8. Large character art (portrait, story, initial) — both dims >= 400
+            // 5. Large character art (portrait, story, initial) — both dims >= 400
             if (fw >= 400 && fh >= 400) {
                 results.push({src: src, alt: alt});
             }
